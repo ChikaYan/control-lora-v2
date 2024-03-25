@@ -1,4 +1,4 @@
-from trainer import main, parse_args
+from trainer_no_acc import main, parse_args
 
 config = parse_args()
 config.cache_dir = ".cache"
@@ -13,7 +13,8 @@ config.enable_xformers_memory_efficient_attention = False
 config.checkpointing_steps = 5000
 config.validation_steps = 5000
 config.report_to = "wandb"
-config.resume_from_checkpoint = "latest"
+# config.resume_from_checkpoint = "latest"
+config.resume_from_checkpoint = None
 # config.push_to_hub = True
 
 config.custom_dataset = "custom_datasets.tutorial.MyDataset"
