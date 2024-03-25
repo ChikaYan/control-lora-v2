@@ -62,18 +62,6 @@ if is_wandb_available():
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.26.3")
 
-# logger = get_logger(__name__)
-
-
-def image_grid(imgs, rows, cols):
-    assert len(imgs) == rows * cols
-
-    w, h = imgs[0].size
-    grid = Image.new("RGB", size=(cols * w, rows * h))
-
-    for i, img in enumerate(imgs):
-        grid.paste(img, box=(i % cols * w, i // cols * h))
-    return grid
 
 
 def log_validation(tokenizer, text_encoder, vae, text_embed, unet, control_lora, args, device, weight_dtype, controls):
@@ -145,107 +133,14 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         raise ValueError(f"{model_class} is not supported.")
 
 
-def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=None, conditioning_type_name=None):
-    conditioning_type = None
-    if conditioning_type_name is not None:
-        conditioning_type = ' '.join([''.join([w[0].upper()] + list(w[1:])) for w in conditioning_type_name.split('-')])
-
-    img_str = ""
-    if image_logs is not None:
-        img_str = "You can find some example images below.\n\n"
-        for i, log in enumerate(image_logs):
-            images = log["images"]
-            validation_prompt = log["validation_prompt"]
-            validation_image = log["validation_image"]
-            validation_image.save(os.path.join(repo_folder, "image_control.png"))
-            img_str += f"prompt: {validation_prompt}\n"
-            images = [validation_image] + images
-            image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
-            img_str += f"![images_{i})](./images_{i}.png)\n"
-
-    yaml = f"""
----
-license: creativeml-openrail-m
-base_model: {base_model}
-tags:
-- stable-diffusion
-- stable-diffusion-diffusers
-- image-to-image
-- diffusers
-- controlnet
-- control-lora
----
-    """
-    model_card = f"""
-# ControlLoRA - {repo_id if conditioning_type is None else conditioning_type + ' Version'}
-
-ControlLoRA is a neural network structure extended from Controlnet to control diffusion models by adding extra conditions. This checkpoint corresponds to the ControlLoRA conditioned on {conditioning_type or 'Unknown Input'}.
-
-ControlLoRA uses the same structure as Controlnet. But its core weight comes from UNet, unmodified. Only hint image encoding layers, linear lora layers and conv2d lora layers used in weight offset are trained.
-
-The main idea is from my [ControlLoRA](https://github.com/HighCWu/ControlLoRA) and sdxl [control-lora](https://huggingface.co/stabilityai/control-lora).
-
-## Example
-
-1. Clone ControlLoRA from [Github](https://github.com/HighCWu/control-lora-v2):
-```sh
-$ git clone https://github.com/HighCWu/control-lora-v2
-```
-
-2. Enter the repo dir:
-```sh
-$ cd control-lora-v2
-```
-
-3. Run code:
-```py
-import torch
-from PIL import Image
-from diffusers import StableDiffusionControlNetPipeline, UNet2DConditionModel, UniPCMultistepScheduler
-from models.control_lora import ControlLoRAModel
-
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
-image = Image.open('<Your Conditioning Image Path>')
-
-base_model = "{base_model}"
-
-unet = UNet2DConditionModel.from_pretrained(
-    base_model, subfolder="unet", torch_dtype=dtype
-)
-control_lora: ControlLoRAModel = ControlLoRAModel.from_pretrained(
-    "{repo_id}", torch_dtype=dtype
-)
-control_lora.tie_weights(unet)
-
-pipe = StableDiffusionControlNetPipeline.from_pretrained(
-    base_model, unet=unet, controlnet=control_lora, safety_checker=None, torch_dtype=dtype
-).to(device)
-control_lora.bind_vae(pipe.vae)
-
-pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
-
-# Remove if you do not have xformers installed
-# see https://huggingface.co/docs/diffusers/v0.13.0/en/optimization/xformers#installing-xformers
-# for installation instructions
-pipe.enable_xformers_memory_efficient_attention()
-
-# pipe.enable_model_cpu_offload()
-
-image = pipe("Girl smiling, professional dslr photograph, high quality", image, num_inference_steps=20).images[0]
-
-image.show()
-```
-
-{img_str}
-"""
-    with open(os.path.join(repo_folder, "README.md"), "w") as f:
-        f.write(yaml + model_card)
-
-
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a ControlLoRA training script.")
+    parser.add_argument(
+        "--conf",
+        type=str,
+        default="conf/default.conf",
+        # required=True,
+    )
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -332,7 +227,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=1000,
         help=(
             "Save a checkpoint of the training state every X updates. Checkpoints can be used for resuming training via `--resume_from_checkpoint`. "
             "In the case that the checkpoint is better than the final trained model, the checkpoint can also be used for inference."
@@ -639,143 +534,14 @@ def check_args(args):
             "`--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the control-lora encoder."
         )
 
-def make_train_dataset(args, tokenizer):
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-    if args.custom_dataset is not None:
-        if isinstance(args.custom_dataset, str):
-            custom_dataset_split = args.custom_dataset.split('.')
-            args.custom_dataset = getattr(importlib.import_module('.'.join(custom_dataset_split[:-1])), custom_dataset_split[-1])()
-        return CustomDataset(args.custom_dataset, args, tokenizer)
-
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-        )
-    else:
-        if args.train_data_dir is not None:
-            dataset = load_dataset(
-                args.train_data_dir,
-                cache_dir=args.cache_dir,
-            )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
-
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
-
-    # 6. Get the column names for input/target.
-    if args.image_column is None:
-        image_column = column_names[0]
-        print(f"image column defaulting to {image_column}")
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    if args.caption_column is None:
-        caption_column = column_names[1]
-        print(f"caption column defaulting to {caption_column}")
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    if args.conditioning_image_column is None:
-        conditioning_image_column = column_names[2]
-        print(f"conditioning image column defaulting to {conditioning_image_column}")
-    else:
-        conditioning_image_column = args.conditioning_image_column
-        if conditioning_image_column not in column_names:
-            raise ValueError(
-                f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-            )
-
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if random.random() < args.proportion_empty_prompts:
-                captions.append("")
-            elif isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        return inputs.input_ids
-
-    image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
-
-    conditioning_image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-        ]
-    )
-
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        images = [image_transforms(image) for image in images]
-
-        conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
-        conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
-
-        examples["pixel_values"] = images
-        examples["conditioning_pixel_values"] = conditioning_images
-        examples["input_ids"] = tokenize_captions(examples)
-
-        return examples
-
-    dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-    # Set the training transforms
-    train_dataset = dataset["train"].with_transform(preprocess_train)
-
-    return train_dataset
-
-
-def collate_fn(examples):
-    pixel_values = torch.stack([example["pixel_values"] for example in examples])
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-    conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
-    conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
-
-    input_ids = torch.stack([example["input_ids"] for example in examples])
-
-    return {
-        "pixel_values": pixel_values,
-        "conditioning_pixel_values": conditioning_pixel_values,
-        "input_ids": input_ids,
-    }
-
-
 def main(args):
     check_args(args)
-    logging_dir = Path(args.output_dir, args.logging_dir)
+    conf = ConfigFactory.parse_file(args.conf)
+
+    logging_dir = Path('log') / conf['run_name']
+    logging_dir.mkdir(exist_ok=True, parents=True)
+
+    args.output_dir = str(logging_dir)
 
     device = 'cuda'
 
@@ -801,11 +567,6 @@ def main(args):
     # Handle the repository creation
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
-
-    if args.push_to_hub:
-        repo_id = create_repo(
-            repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
-        ).repo_id
 
     # Load the tokenizer
     if args.tokenizer_name:
@@ -915,7 +676,6 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    conf = ConfigFactory.parse_file('conf/default.conf')
 
     train_dataset = FaceDataset(
         data_folder=conf['dataset.data_folder'],
@@ -1152,42 +912,42 @@ def main(args):
             ).sample
 
 
-            
-            ### train with final image ###
-            assert noise_scheduler.config.prediction_type == "epsilon"
+            if conf.get_bool('train_on_img', False):
+                ### train with final image ###
+                assert noise_scheduler.config.prediction_type == "epsilon"
 
-            def noise_sched_remove_noise(noise_scheduler, noisy_samples, noise, timesteps):
-                alphas_cumprod = noise_scheduler.alphas_cumprod.to(dtype=noisy_samples.dtype)
-                timesteps = timesteps.to(noisy_samples.device)
+                def noise_sched_remove_noise(noise_scheduler, noisy_samples, noise, timesteps):
+                    alphas_cumprod = noise_scheduler.alphas_cumprod.to(dtype=noisy_samples.dtype)
+                    timesteps = timesteps.to(noisy_samples.device)
 
-                sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
-                sqrt_alpha_prod = sqrt_alpha_prod.flatten()
-                while len(sqrt_alpha_prod.shape) < len(noisy_samples.shape):
-                    sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
+                    sqrt_alpha_prod = alphas_cumprod[timesteps] ** 0.5
+                    sqrt_alpha_prod = sqrt_alpha_prod.flatten()
+                    while len(sqrt_alpha_prod.shape) < len(noisy_samples.shape):
+                        sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
 
-                sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
-                sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
-                while len(sqrt_one_minus_alpha_prod.shape) < len(noisy_samples.shape):
-                    sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
+                    sqrt_one_minus_alpha_prod = (1 - alphas_cumprod[timesteps]) ** 0.5
+                    sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.flatten()
+                    while len(sqrt_one_minus_alpha_prod.shape) < len(noisy_samples.shape):
+                        sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
 
-                original_samples = (noisy_samples - sqrt_one_minus_alpha_prod * noise) / sqrt_alpha_prod
-                return original_samples
-            
-            denoised_latent = noise_sched_remove_noise(noise_scheduler, noisy_latents, model_pred, timesteps)
-            # denoised_latent = noise_sched_remove_noise(noise_scheduler, noisy_latents, noise, timesteps)
-            pred_img = vae.decode(denoised_latent / vae.config.scaling_factor)[0]
-            loss = F.mse_loss(pred_img.float(), gt.float(), reduction="mean")
+                    original_samples = (noisy_samples - sqrt_one_minus_alpha_prod * noise) / sqrt_alpha_prod
+                    return original_samples
+                
+                denoised_latent = noise_sched_remove_noise(noise_scheduler, noisy_latents, model_pred, timesteps)
+                # denoised_latent = noise_sched_remove_noise(noise_scheduler, noisy_latents, noise, timesteps)
+                pred_img = vae.decode(denoised_latent / vae.config.scaling_factor)[0]
+                loss = F.mse_loss(pred_img.float(), gt.float(), reduction="mean")
 
-            
-            ### train with standard loss ###
-            # # Get the target for loss depending on the prediction type
-            # if noise_scheduler.config.prediction_type == "epsilon":
-            #     target = noise
-            # elif noise_scheduler.config.prediction_type == "v_prediction":
-            #     target = noise_scheduler.get_velocity(latents, noise, timesteps)
-            # else:
-            #     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-            # loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            else:
+                ### train with standard loss ###
+                # Get the target for loss depending on the prediction type
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             loss.backward()
             optimizer.step()
@@ -1198,30 +958,14 @@ def main(args):
             progress_bar.update(1)
             global_step += 1
 
-            # if global_step == 1 or global_step % args.checkpointing_steps == 0:
-            #     # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-            #     if args.checkpoints_total_limit is not None:
-            #         checkpoints = os.listdir(args.output_dir)
-            #         checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-            #         checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+            if global_step == 1 or global_step % args.checkpointing_steps == 0:
+                # save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                save_path = os.path.join(args.output_dir, f"checkpoint-latest")
+                save_models([control_lora],save_path)
+                print(f"Saved state to {save_path}")
 
-            #         # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-            #         if len(checkpoints) >= args.checkpoints_total_limit:
-            #             num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-            #             removing_checkpoints = checkpoints[0:num_to_remove]
-
-            #             print(
-            #                 f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-            #             )
-            #             print(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-            #             for removing_checkpoint in removing_checkpoints:
-            #                 removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-            #                 shutil.rmtree(removing_checkpoint)
-
-            #     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-            #     save_models([unet, control_lora],save_path)
-            #     print(f"Saved state to {save_path}")
+                # save text mebedding
+                torch.save(text_embed.data, os.path.join(args.output_dir, f"embed-latest"))
 
 
             if (global_step == 1 or global_step % conf['log_im_every'] == 0):
@@ -1241,8 +985,8 @@ def main(args):
 
                 for i, im_log in enumerate(image_logs):
                     imageio.imwrite(
-                        os.path.join(args.output_dir, f"train_{global_step:05d}_{i:02d}.png"),
-                        np.concatenate([np.array(im_log['images'])[-1], np.array(im_log['control']), (((gt[i] + 1.) / 2.).permute([1,2,0]).cpu().numpy() * 255).astype(np.uint8)], axis=1),
+                        os.path.join(str(logging_dir), f"train_{global_step:05d}_{i:02d}.png"),
+                        np.concatenate([np.asarray(im_log['images'][-1]), np.array(im_log['control']), (((gt[i] + 1.) / 2.).permute([1,2,0]).cpu().numpy() * 255).astype(np.uint8)], axis=1),
                         )
 
                 # log test
@@ -1274,8 +1018,8 @@ def main(args):
 
                 for i, im_log in enumerate(image_logs):
                     imageio.imwrite(
-                        os.path.join(args.output_dir, f"train_{global_step:05d}_{i:02d}.png"),
-                        np.concatenate([np.array(im_log['images'])[-1], np.array(im_log['control']), (((gt[i] + 1.) / 2.).permute([1,2,0]).cpu().numpy() * 255).astype(np.uint8)], axis=1),
+                        os.path.join(str(logging_dir), f"val_{global_step:05d}_{i:02d}.png"),
+                        np.concatenate([np.asarray(im_log['images'][-1]), np.array(im_log['control']), (((gt[i] + 1.) / 2.).permute([1,2,0]).cpu().numpy() * 255).astype(np.uint8)], axis=1),
                         )
 
 
@@ -1299,10 +1043,11 @@ def main(args):
     #     control
     # )
     # for i, im_log in enumerate(image_logs):
-    #     imageio.imwrite(
-    #         os.path.join(args.output_dir, f"val_{global_step:05d}_{i:02d}.png"),
-    #         np.concatenate([np.array(im_log['images'])[-1], np.array(im_log['contorl'])], axis=1),
-    #         )
+        # imageio.imwrite(
+        #     os.path.join(args.output_dir, f"train_{global_step:05d}_{i:02d}.png"),
+        #     np.concatenate([np.asarray(im_log['images'][-1]), np.array(im_log['control']), (((gt[i] + 1.) / 2.).permute([1,2,0]).cpu().numpy() * 255).astype(np.uint8)], axis=1),
+        #     )
+
 
     # control_lora = control_lora
     # control_lora.save_pretrained(args.output_dir)

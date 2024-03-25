@@ -169,3 +169,6 @@ tmp*
 /output
 /ckpt
 /data
+
+
+log/
