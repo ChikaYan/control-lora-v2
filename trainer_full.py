@@ -959,7 +959,8 @@ def main(args):
             progress_bar.update(1)
             global_step += 1
 
-            if global_step == 1 or global_step % args.checkpointing_steps == 0:
+            # if global_step == 1 or global_step % args.checkpointing_steps == 0:
+            if False:
                 # save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                 save_path = os.path.join(args.output_dir, f"checkpoint-latest")
                 save_models([control_lora],save_path)
@@ -1031,6 +1032,43 @@ def main(args):
 
             if global_step >= args.max_train_steps:
                 break
+
+
+    # log test
+    for test_i in range(len(test_dataset)):
+        _, model_input, test_data = test_dataset[test_i]
+        for k, v in test_data.items():
+            try:
+                test_data[k] = v.to(device)
+            except:
+                test_data[k] = v
+
+        control = einops.rearrange(test_data['dwpose_im'][None,...], 'b h w c -> b c h w')
+        B, _, H, W = control.shape
+        gt = einops.rearrange(test_data['rgb'][None,...].reshape([B, H, W, 3]), 'b h w c -> b c h w').float()
+        gt = gt * 2. - 1.
+
+        image_logs = log_validation(
+            tokenizer,
+            text_encoder,
+            vae,
+            text_embed,
+            unet,
+            control_lora,
+            args,
+            device,
+            weight_dtype,
+            control
+        )
+
+        test_log_dir = logging_dir / 'test'
+        test_log_dir.mkdir(exist_ok=True, parents=True)
+
+        for i, im_log in enumerate(image_logs):
+            imageio.imwrite(
+                os.path.join(str(test_log_dir), f"{model_input['img_name']}.png"),
+                np.concatenate([np.asarray(im_log['images'][-1]), np.array(im_log['control']), (((gt[i] + 1.) / 2.).permute([1,2,0]).cpu().numpy() * 255).astype(np.uint8)], axis=1),
+                )
 
     # # Create the pipeline using using the trained modules and save it.
     # image_logs = log_validation(
