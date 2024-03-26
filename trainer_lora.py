@@ -44,6 +44,7 @@ import diffusers
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
+    ControlNetModel,
     StableDiffusionControlNetPipeline,
     UNet2DConditionModel,
     UniPCMultistepScheduler,
@@ -54,7 +55,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 import utils
 from custom_datasets import CustomDataset
-from models.control_lora import ControlLoRAModel
+# from models.control_lora import ControlLoRAModel
 import imageio
 
 from custom_datasets.real_dataset import FaceDataset
@@ -84,9 +85,9 @@ def log_validation(tokenizer, text_encoder, vae, text_embed, unet, control_lora,
         torch_dtype=weight_dtype, 
         cache_dir=args.cache_dir,
     )
+    pipeline.set_progress_bar_config(disable=True)
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(device)
-    pipeline.set_progress_bar_config(disable=True)
 
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
@@ -95,8 +96,6 @@ def log_validation(tokenizer, text_encoder, vae, text_embed, unet, control_lora,
         generator = None
     else:
         generator = torch.Generator(device=device).manual_seed(args.seed)
-
-    
 
     image_logs = []
 
@@ -506,49 +505,15 @@ def parse_args(input_args=None):
 
     return args
 
-def check_args(args):
-    if args.custom_dataset is None and args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Specify `--custom_dataset`, `--dataset_name` or `--train_data_dir`")
 
-    if args.custom_dataset is not None and args.dataset_name is not None and args.train_data_dir is not None:
-        raise ValueError("Specify only one of `--custom_dataset`, `--dataset_name` or `--train_data_dir`")
-
-    if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
-        raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
-
-    if args.validation_prompt is not None and args.validation_image is None:
-        raise ValueError("`--validation_image` must be set if `--validation_prompt` is set")
-
-    if args.validation_prompt is None and args.validation_image is not None:
-        raise ValueError("`--validation_prompt` must be set if `--validation_image` is set")
-
-    if (
-        args.validation_image is not None
-        and args.validation_prompt is not None
-        and len(args.validation_image) != 1
-        and len(args.validation_prompt) != 1
-        and len(args.validation_image) != len(args.validation_prompt)
-    ):
-        raise ValueError(
-            "Must provide either 1 `--validation_image`, 1 `--validation_prompt`,"
-            " or the same number of `--validation_prompt`s and `--validation_image`s"
-        )
-
-    if args.resolution % 8 != 0:
-        raise ValueError(
-            "`--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the control-lora encoder."
-        )
-
-
-
-def save_model_weights(text_embed, controlnet: ControlLoRAModel, unet: UNet2DConditionModel=None, unet_train_mode='none', save_dir=None):
+def save_model_weights(text_embed, controlnet: ControlNetModel, unet: UNet2DConditionModel=None, control_train_mode='none', unet_train_mode='none', save_dir=None):
     save_dir = Path(save_dir)
     save_dir.mkdir(exist_ok=True, parents=True)
     
-
     torch.save(text_embed.data, str(save_dir / f"embed-latest.tensor"))
 
-    controlnet.save_pretrained(str(save_dir / f"controlnet-latest"))
+    if control_train_mode == 'full':
+        controlnet.save_pretrained(str(save_dir / f"controlnet-latest"))
 
     if unet_train_mode == 'lora':
         unet_lora_layers_to_save = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
@@ -560,14 +525,14 @@ def save_model_weights(text_embed, controlnet: ControlLoRAModel, unet: UNet2DCon
         unet.save_pretrained(str(save_dir / f"unet-latest"))
 
 
-def load_model_weights(text_embed, controlnet: ControlLoRAModel, unet: UNet2DConditionModel, unet_train_mode='none', save_dir=None, device='cuda'):
+def load_model_weights(text_embed, controlnet: ControlNetModel, unet: UNet2DConditionModel, control_train_mode='none', unet_train_mode='none', save_dir=None, device='cuda'):
     text_embed.data = torch.load(str(save_dir / f"embed-latest.tensor")).to(device)
 
-    load_controlnet = ControlLoRAModel.from_pretrained(str(save_dir / f"controlnet-latest"))
-    controlnet.register_to_config(**load_controlnet.config)
-    controlnet.load_state_dict(load_controlnet.state_dict())
-    del load_controlnet
-    controlnet.tie_weights(unet)
+    if control_train_mode == 'full':
+        load_controlnet = ControlNetModel.from_pretrained(str(save_dir / f"controlnet-latest"))
+        controlnet.register_to_config(**load_controlnet.config)
+        controlnet.load_state_dict(load_controlnet.state_dict())
+        del load_controlnet
 
     if unet_train_mode == 'lora':
         lora_state_dict, network_alphas = LoraLoaderMixin.lora_state_dict(str(save_dir))
@@ -592,10 +557,19 @@ def load_model_weights(text_embed, controlnet: ControlLoRAModel, unet: UNet2DCon
 
 
 def main(args):
-    check_args(args)
     conf = ConfigFactory.parse_file(args.conf)
+    conf['run_name'] = Path(args.conf).stem
+
+    args.train_batch_size = conf.get('train_batch_size', args.train_batch_size)
+    args.learning_rate = conf.get('learning_rate', args.learning_rate)
+    args.max_train_steps = conf.get('max_train_steps', args.max_train_steps)
+    args.resolution = conf.get('resolution', args.resolution)
+    args.seed = conf.get('seed', args.seed)
+    args.checkpointing_steps = conf.get('checkpointing_steps', args.checkpointing_steps)
+    args.pretrained_model_name_or_path = conf.get('pretrained_model_name_or_path', args.pretrained_model_name_or_path)
 
     UNET_TRAIN_MODE = conf.get('unet_train_mode', 'none') # none, lora, full
+    CONTROLNET_TRAIN_MODE = conf.get('controlnet_train_mode', 'none') # none, full
 
     logging_dir = Path('log') / conf['run_name']
     logging_dir.mkdir(exist_ok=True, parents=True)
@@ -652,48 +626,16 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, cache_dir=args.cache_dir
     )
 
-    control_lora: ControlLoRAModel
+    controlnet: ControlNetModel
     if args.control_lora_model_name_or_path:
         print("Loading existing control-lora weights")
-        control_lora = ControlLoRAModel.from_pretrained(args.control_lora_model_name_or_path, cache_dir=args.cache_dir)
-        control_lora.tie_weights(unet)
+        controlnet = ControlNetModel.from_pretrained(args.control_lora_model_name_or_path, cache_dir=args.cache_dir)
     else:
         print("Initializing control-lora weights from unet")
-        control_lora = ControlLoRAModel.from_unet(
-            unet, 
-            lora_linear_rank=args.control_lora_linear_rank, 
-            lora_conv2d_rank=args.control_lora_conv2d_rank,
-            use_conditioning_latent=args.use_conditioning_latent,
-            use_same_level_conditioning_latent=args.use_same_level_conditioning_latent,
-            use_dora=args.use_dora,
-        )
-
-    # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-    def save_models(models, output_dir):
-        for i in range(len(models)):
-            model: ControlLoRAModel = models[i]
-
-            sub_dir = "control-lora"
-            model.save_pretrained(os.path.join(output_dir, sub_dir))
-
-
-    def load_models(models, input_dir):
-        while len(models) > 0:
-            # pop models so that they are not loaded again
-            model: ControlLoRAModel = models.pop()
-
-            # load diffusers style into model
-            load_model = ControlLoRAModel.from_pretrained(input_dir, subfolder="control-lora")
-            model.register_to_config(**load_model.config)
-
-            model.load_state_dict(load_model.state_dict())
-            del load_model
-
-            model.tie_weights(unet)
-
+        controlnet = ControlNetModel.from_unet(unet)
     
-    control_lora.train()
-    control_lora.bind_vae(vae)
+    controlnet.requires_grad_(False)
+    controlnet.eval()
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -712,9 +654,13 @@ def main(args):
         unet.requires_grad_(True)
         unet.train()
 
+    if CONTROLNET_TRAIN_MODE == 'full':
+        controlnet.requires_grad_(True)
+        controlnet.train()
+
 
     if args.gradient_checkpointing:
-        control_lora.enable_gradient_checkpointing()
+        controlnet.enable_gradient_checkpointing()
 
     # Check that all trainable models are in full precision
     low_precision_error_string = (
@@ -722,9 +668,9 @@ def main(args):
         " doing mixed precision training, copy of the weights should still be float32."
     )
 
-    if control_lora.dtype != torch.float32:
+    if controlnet.dtype != torch.float32:
         raise ValueError(
-            f"ControlLoRA loaded as datatype {control_lora.dtype}. {low_precision_error_string}"
+            f"Controlnet loaded as datatype {controlnet.dtype}. {low_precision_error_string}"
         )
 
     # Enable TF32 for faster training on Ampere GPUs,
@@ -741,7 +687,7 @@ def main(args):
     optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
-    params_to_optimize = [param for param in control_lora.parameters() if param.requires_grad]
+    params_to_optimize = [param for param in controlnet.parameters() if param.requires_grad]
     params_to_optimize += [param for param in unet.parameters() if param.requires_grad]
     
     print(f"Unet num of trainable param: {len([param for param in unet.parameters() if param.requires_grad])}")
@@ -766,7 +712,7 @@ def main(args):
     )
 
     train_dataloader = torch.utils.data.DataLoader(train_dataset,
-                                                    batch_size=conf['batch_size'],
+                                                    batch_size=conf['train_batch_size'],
                                                     shuffle=True,
                                                     collate_fn=train_dataset.collate_fn,
                                                     num_workers=4,
@@ -782,10 +728,12 @@ def main(args):
         **conf.get_config('dataset.test')
     )
 
-    TEST_IDS = np.array(conf['dataset.test_log_ids']) - 2672 + 500
+    # select a few test frames with hands to be logged during training
+    dataset_total_len = len(list((Path(conf['dataset.data_folder']) / conf['subject'] / conf['subject'] / 'all' / 'image').glob('*.png')))
+    TEST_IDS = np.array(conf['test_log_ids']) - dataset_total_len - conf.get('dataset.test.frame_interval', [0,0])[0]
 
     test_dataloader = torch.utils.data.DataLoader(test_dataset,
-                                                    batch_size=conf['batch_size'],
+                                                    batch_size=1,
                                                     shuffle=True,
                                                     collate_fn=test_dataset.collate_fn,
                                                     num_workers=4,
@@ -816,7 +764,7 @@ def main(args):
     vae.to(device, dtype=weight_dtype)
     unet.to(device, dtype=weight_dtype)
     text_encoder.to(device, dtype=weight_dtype)
-    control_lora.to(device, dtype=weight_dtype)
+    controlnet.to(device, dtype=weight_dtype)
 
     # initialize text_embed
     def compute_text_embeddings(prompt):
@@ -892,22 +840,12 @@ def main(args):
     first_epoch = 0
 
     # Potentially load in the weights and states from a previous save
-    load_model_weights(text_embed, control_lora, unet, UNET_TRAIN_MODE, Path(args.output_dir) / 'ckpt', device)
+
+    # load_model_weights(text_embed, controlnet, unet, CONTROLNET_TRAIN_MODE, UNET_TRAIN_MODE, Path(args.output_dir) / 'ckpt', device)
     if conf.get('resume', False):
         print('Currently resume is not supported, ckpt can only be used for inference!')
-        initial_global_step = 0
-        
-        # load_model_weights(text_embed, control_lora, unet, UNET_TRAIN_MODE, Path(args.output_dir) / 'ckpt', device)
 
-        # raise NotImplementedError()
-        # print(f"Resuming from checkpoint {path}")
-        # accelerator.load_state(os.path.join(args.output_dir, path))
-        # global_step = int(path.split("-")[1])
-
-        # initial_global_step = global_step
-        # first_epoch = global_step // num_update_steps_per_epoch
-    else:
-        initial_global_step = 0
+    initial_global_step = 0
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),
@@ -953,11 +891,10 @@ def main(args):
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
 
-
             # Get the text embedding for conditioning
             encoder_hidden_states = text_embed
 
-            down_block_res_samples, mid_block_res_sample = control_lora(
+            down_block_res_samples, mid_block_res_sample = controlnet(
                 noisy_latents,
                 timesteps,
                 encoder_hidden_states=encoder_hidden_states,
@@ -1024,7 +961,7 @@ def main(args):
             global_step += 1
 
             if global_step == 1 or global_step % args.checkpointing_steps == 0:
-                save_model_weights(text_embed, control_lora, unet, UNET_TRAIN_MODE, Path(args.output_dir) / 'ckpt')
+                save_model_weights(text_embed, controlnet, unet, CONTROLNET_TRAIN_MODE, UNET_TRAIN_MODE, Path(args.output_dir) / 'ckpt')
 
 
             if (global_step == 1 or global_step % conf['log_im_every'] == 0):
@@ -1035,7 +972,7 @@ def main(args):
                     vae,
                     text_embed,
                     unet,
-                    control_lora,
+                    controlnet,
                     args,
                     device,
                     weight_dtype,
@@ -1068,7 +1005,7 @@ def main(args):
                     vae,
                     text_embed,
                     unet,
-                    control_lora,
+                    controlnet,
                     args,
                     device,
                     weight_dtype,
@@ -1090,7 +1027,7 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
     
-    save_model_weights(text_embed, control_lora, unet, UNET_TRAIN_MODE, Path(args.output_dir) / 'ckpt')
+    save_model_weights(text_embed, controlnet, unet, CONTROLNET_TRAIN_MODE, UNET_TRAIN_MODE, Path(args.output_dir) / 'ckpt')
     
     # log test
     for test_i in range(len(test_dataset)):
@@ -1112,7 +1049,7 @@ def main(args):
             vae,
             text_embed,
             unet,
-            control_lora,
+            controlnet,
             args,
             device,
             weight_dtype,
@@ -1124,7 +1061,7 @@ def main(args):
 
         for i, im_log in enumerate(image_logs):
             imageio.imwrite(
-                os.path.join(str(test_log_dir), f"{model_input['img_name']}.png"),
+                os.path.join(str(test_log_dir), f"{model_input['img_name'].item()}.png"),
                 np.concatenate([np.asarray(im_log['images'][-1]), np.array(im_log['control']), (((gt[i] + 1.) / 2.).permute([1,2,0]).cpu().numpy() * 255).astype(np.uint8)], axis=1),
                 )
 
