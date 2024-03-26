@@ -12,6 +12,10 @@ from PIL import Image
 from pathlib import Path
 from tqdm.auto import tqdm
 from packaging import version
+from peft import LoraConfig
+from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
+
+
 
 import numpy as np
 
@@ -639,6 +643,15 @@ def main(args):
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
+    # unet_lora_config = LoraConfig(
+    #     r=4,
+    #     lora_alpha=4,
+    #     init_lora_weights="gaussian",
+    #     target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj"],
+    # )
+    # unet.add_adapter(unet_lora_config)
+    # unet.train()
+
     if args.gradient_checkpointing:
         control_lora.enable_gradient_checkpointing()
 
@@ -668,6 +681,7 @@ def main(args):
 
     # Optimizer creation
     params_to_optimize = [param for param in control_lora.parameters() if param.requires_grad]
+    params_to_optimize += [param for param in unet.parameters() if param.requires_grad]
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
