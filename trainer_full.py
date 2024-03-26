@@ -636,7 +636,8 @@ def main(args):
     control_lora.train()
     control_lora.bind_vae(vae)
     vae.requires_grad_(False)
-    unet.requires_grad_(False)
+    unet.requires_grad_(True)
+    unet.train() # train the unet alone with control lora
     text_encoder.requires_grad_(False)
 
     if args.gradient_checkpointing:
@@ -668,8 +669,10 @@ def main(args):
 
     # Optimizer creation
     params_to_optimize = [param for param in control_lora.parameters() if param.requires_grad]
+    params_to_optimize += [param for param in unet.parameters() if param.requires_grad]
     optimizer = optimizer_class(
         params_to_optimize,
+        # lr=args.learning_rate,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -681,7 +684,6 @@ def main(args):
         data_folder=conf['dataset.data_folder'],
         subject_name=conf['subject'],
         json_name='flame_params.json',
-        # use_background=False,
         load_body_ldmk=False,
         is_eval=False,
         **conf.get_config('dataset.train')
@@ -698,7 +700,6 @@ def main(args):
         data_folder=conf['dataset.data_folder'],
         subject_name=conf['subject'],
         json_name='flame_params.json',
-        # use_background=False,
         load_body_ldmk=False,
         is_eval=False,
         **conf.get_config('dataset.test')
