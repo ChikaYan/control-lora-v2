@@ -12,10 +12,6 @@ from PIL import Image
 from pathlib import Path
 from tqdm.auto import tqdm
 from packaging import version
-from peft import LoraConfig
-from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
-
-
 
 import numpy as np
 
@@ -640,17 +636,9 @@ def main(args):
     control_lora.train()
     control_lora.bind_vae(vae)
     vae.requires_grad_(False)
-    unet.requires_grad_(False)
+    unet.requires_grad_(True)
+    unet.train() # train the unet alone with control lora
     text_encoder.requires_grad_(False)
-
-    # unet_lora_config = LoraConfig(
-    #     r=4,
-    #     lora_alpha=4,
-    #     init_lora_weights="gaussian",
-    #     target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj"],
-    # )
-    # unet.add_adapter(unet_lora_config)
-    # unet.train()
 
     if args.gradient_checkpointing:
         control_lora.enable_gradient_checkpointing()
@@ -684,6 +672,7 @@ def main(args):
     params_to_optimize += [param for param in unet.parameters() if param.requires_grad]
     optimizer = optimizer_class(
         params_to_optimize,
+        # lr=args.learning_rate,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -695,7 +684,6 @@ def main(args):
         data_folder=conf['dataset.data_folder'],
         subject_name=conf['subject'],
         json_name='flame_params.json',
-        # use_background=False,
         load_body_ldmk=False,
         is_eval=False,
         **conf.get_config('dataset.train')
@@ -712,7 +700,6 @@ def main(args):
         data_folder=conf['dataset.data_folder'],
         subject_name=conf['subject'],
         json_name='flame_params.json',
-        # use_background=False,
         load_body_ldmk=False,
         is_eval=False,
         **conf.get_config('dataset.test')
